@@ -1,0 +1,23 @@
+snapshot-system
+---------------
+
+Many people have their Linux filesystem on LVM volumes, keeping only
+/boot on a raw partition if the boot loader does not understand LVM.
+The snapshot-system script mounts the complete filesystem recursively,
+using snapshots for LVM volumes and bind mounts for other devices.  It
+was developed (and is most useful) for creating stable backups.
+
+The mounted devices must be defined in /etc/fstab.  The script is smart
+enough to ignore /proc, filesystems with the 'noauto' option and swap.
+
+For example, to mount the filesystem on /mnt, excluding the device at
+/media/cdrom, and use a snapshot size of 1 GB:
+
+  $ snapshot-system mount -s 1G -e /media/cdrom /mnt
+
+Project homepage: https://github.com/jcassee/snapshot-system
+Improvements are very welcome.  Please fork the source, commit
+your changes and send a pull request.
+
+Written by Joost Cassee <joost@cassee.net>.  Placed in the public
+domain.

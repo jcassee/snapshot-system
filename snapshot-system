@@ -1,0 +1,209 @@
+#!/usr/bin/perl -w
+#
+# Mount a complete Linux filesystem as LVM snapshots
+#
+# Written by Joost Cassee and placed in the public domain.
+
+use warnings;
+use strict;
+
+use vars qw($basename);
+BEGIN {
+        $basename = 'snapshot_system';
+        $SIG{__DIE__} = sub { die "$basename: $_[0]" };
+        $SIG{__WARN__} = sub { warn "$basename: $_[0]" };
+}
+
+use Cwd 'abs_path';
+use File::Spec::Functions;
+use Getopt::Long;
+
+use constant DEFAULT_SNAP_SIZE => '100M';
+
+my $snap_size;
+my @excludes;
+my $help;
+
+Getopt::Long::Configure ("bundling");
+GetOptions(
+	's|size=s' => \$snap_size,
+	'e|exclude=s' => \@excludes,
+	'h|help' => \$help,
+) or exit 1;
+
+if ($help) {
+	print <<"EOM";
+usage: $basename mount [OPTIONS] MOUNTPOINT
+       $basename unmount MOUNTPOINT
+
+Mounts or unmounts the complete file space on MOUNTPOINT, making snapshots of
+filesystems on logical volumes.
+
+Options:
+ -s, --size=SIZE     Sets the size of created snapshots to SIZE (default: 100M)
+ -e, --exclude=PATH  Excludes mountpoint PATH
+EOM
+	exit;
+}
+
+die "not enough argumnets\n" if $#ARGV < 1;
+
+my $action = $ARGV[0];
+my $mountpoint = $ARGV[1];
+
+if ($action eq 'mount') {
+	mount();
+} elsif ($action eq 'unmount') {
+	unmount($mountpoint);
+} else {
+	die "unknown action: $action\n";
+}
+
+sub mount {
+	$snap_size = DEFAULT_SNAP_SIZE unless $snap_size;
+	my %excludes;
+	for (@excludes) {
+		system('mountpoint', '-q', $_);
+		die "exclude path is not a mountpoint: $_\n" if $? != 0;
+		$excludes{$_} = 1;
+	}
+
+	die "mountpoint is not a directory: $mountpoint\n"
+		unless -d $mountpoint;
+
+	system('mountpoint', '-q', $mountpoint);
+	die "a filesystem is already mounted on $mountpoint\n" if $? == 0;
+
+	print "Mounting the filesystem on $mountpoint\n";
+	
+	my %lvs = get_lvs();
+
+	open(FH, '/etc/fstab') or die "error reading /etc/fstab: $!\n";
+	my $ln = 0;
+	while (<FH>) {
+		chomp;
+		$ln++;
+		next if /^\s*#/;
+		next if /^\s*$/;
+		
+		my ($dev, $mnt, $type, $opt, $dump, $pass) = split;
+		die "error parsing /etc/fstab line $ln\n" unless defined $pass;
+
+		next unless $mnt =~ m#^/#;
+		next if $excludes{$mnt};
+		next if $opt =~ /\bnoauto\b/;
+		next if $type =~ /\bproc\b/;
+
+		my $mp = $mountpoint . $mnt;
+		$mp =~ s/\/$//;
+
+		my ($vg, $lv) = parse_lvm_device($dev, %lvs);
+		if ($vg) {
+			my $snap = "$lv.snap";
+			command('lvcreate', '-s', '-L', $snap_size, '-n',
+				$snap, "$vg/$lv");
+			command('mount', '-t', $type, "/dev/$vg/$snap", $mp);
+			print "  Logical volume \"$snap\" mounted on $mp\n";
+		} else {
+			command('mount', '--bind', $mnt, $mp);
+			print "  Path $mnt bound to $mp\n";
+		}
+	}
+	close(FH) or die "error reading /etc/fstab: $!\n";
+}
+
+sub unmount {
+	my ($path) = @_;
+	
+	die "unmount takes no options"
+		if defined $snap_size or @excludes;
+
+	system('mountpoint', '-q', $mountpoint);
+	die "no filesystem is mounted on $mountpoint\n" unless $? == 0;
+
+	print "Unmounting the filesystem from $mountpoint\n";
+
+	my %lvs = get_lvs();
+	my %mps = get_mounts($path);
+
+	foreach my $mp (reverse sort keys %mps) {
+		system('umount', $mp);
+		my $dev = $mps{$mp};
+		my ($vg, $lv) = parse_lvm_device($dev, %lvs);
+		if ($vg) {
+			my $attr = get_lvm_attr($vg, $lv, %lvs);
+			if (substr($attr, 0, 1) eq 's') {
+				print "  Logical volume \"$lv\" unmounted from $mp\n";
+				command('lvremove', '-f', "$vg/$lv");
+			} else {
+				print "  Path $dev unbound from $mp\n";
+			}
+		} else {
+			print "  Path $dev unbound from $mp\n";
+		}
+	}
+}
+
+sub get_lvs {
+	my %lvs;
+	open(FH, 'vgs -o vg_name,lv_name,lv_attr --noheadings --unbuffered|')
+		or die "error executing vgs: $!\n";
+	while(<FH>) {
+		chomp;
+		my ($vg, $lv, $attr) = split;
+		$lvs{$vg}->{$lv} = $attr;
+	}
+	close(FH) or die "error executing vgs: $!\n";
+	return %lvs;
+}
+
+sub get_mounts {
+	my ($path) = @_;
+	$path =~ s#/$##;
+	my %mps = ();
+	open(FH, 'mount|')
+		or die "error executing mount: $!\n";
+	while(<FH>) {
+		chomp;
+		my ($dev, undef, $mp, undef) = split;
+		if ($mp =~ m#^$path#) {
+			$mps{$mp} = $dev;
+		}
+	}
+	close(FH) or die "error executing mount: $!\n";
+	return %mps;
+}
+
+sub get_lvm_attr {
+	my ($vg, $lv, %lvs) = @_;
+	return $lvs{$vg}->{$lv};
+}
+
+sub parse_lvm_device {
+	my ($dev, %lvs) = @_;
+	if ($dev =~ /^UUID=(.*)/) {
+		$dev = catfile('/dev/disk/by-uuid', $1);
+		return undef unless defined readlink($dev);
+		$dev = catfile('/dev/disk/by-uuid', readlink($dev));
+		$dev = abs_path($dev);
+	}
+	my ($vg, $lv);
+	if (($vg, $lv) = $dev =~ m#/dev/mapper/([^-]+)-(.+)$#) {
+		$lv =~ s/--/-/g;
+		return ($vg, $lv) if get_lvm_attr($vg, $lv, %lvs);
+	} elsif (($vg, $lv) = $dev =~ m#/dev/([^/]+)/([^/]+)$#) {
+		return ($vg, $lv) if get_lvm_attr($vg, $lv, %lvs);
+	}
+	return undef;
+}
+
+sub command {
+	system(@_);
+	if ($? == -1) {
+		die "failed to execute '@_': $!\n";
+	} elsif ($? & 127) {
+		die "command '@_' died with signal " . ($? & 127) . "\n";
+	} elsif ($? > 0) {
+		die "command '@_' exited with value " . ($? >> 8) . "\n";
+	}
+}
